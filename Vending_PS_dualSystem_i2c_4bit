@@ -1,0 +1,483 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // Untuk LCD Sistem 1 (I2C)
+#include <LiquidCrystal.h>     // Untuk LCD Sistem 2 (Paralel)
+#include <EEPROM.h>
+
+// --- Definisi PIN untuk SISTEM 1 dan SISTEM 2 ---
+
+// Sistem 1 (LCD I2C)
+#define COIN_PIN_1 32       // Coin Acceptor 1
+#define RELAY_PIN_1 25      // Relay 1
+#define LCD_ADDR_1 0x27     // Alamat I2C LCD 1
+
+// Sistem 2 (LCD Paralel)
+#define COIN_PIN_2 33       // Coin Acceptor 2
+#define RELAY_PIN_2 26      // Relay 2
+
+// PIN LCD PARALEL 16x2 untuk SISTEM 2
+// CATATAN: Pin-pin ini HARUS disesuaikan dengan koneksi Anda ke LCD standar 16x2
+#define LCD_RS_2 12
+#define LCD_EN_2 13
+#define LCD_D4_2 5
+#define LCD_D5_2 18
+#define LCD_D6_2 19
+#define LCD_D7_2 23 
+
+
+// Tombol (Satu set tombol untuk kontrol kedua sistem)
+#define BUTTON_OK 14
+#define BUTTON_UP 27
+#define BUTTON_DOWN 2
+
+// --- Definisi EEPROM ---
+#define EEPROM_SIZE 16      
+#define ADDR_DURASI_500_1 0 
+#define ADDR_DURASI_1000_1 4
+#define ADDR_DURASI_500_2 8 
+#define ADDR_DURASI_1000_2 12
+
+// --- Enumerasi dan Variabel Global ---
+
+enum Mode { STANDBY,
+             RUNNING,
+             MENU,
+             SET_500_1,
+             SET_1000_1,
+             SET_500_2,
+             SET_1000_2,
+             EXIT_MENU };
+
+Mode mode = STANDBY;
+int selectedMenu = 0;
+const long MAX_WAKTU = 86400L; // 24 jam
+
+// --- Struktur Data untuk Setiap Sistem (2 set) ---
+struct SystemData {
+  // Pointer void untuk menampung objek LCD yang berbeda
+  void *lcd; 
+  int coinPin;
+  int relayPin;
+  volatile int coinPulseCount;
+  volatile unsigned long lastCoinPulseTime;
+  unsigned long totalWaktu_detik;
+  unsigned long waktuMulai;
+  bool isRunning;
+  int durasi500;
+  int durasi1000;
+  String lastLine1;
+  String lastLine2;
+};
+
+SystemData systems[2]; // Array untuk 2 sistem
+
+// --- Prototipe Fungsi ---
+void IRAM_ATTR detectCoin1();
+void IRAM_ATTR detectCoin2();
+void tampilLCD(int sysIndex, const String &line1, const String &line2);
+void tambahWaktu(int sysIndex, int pulsa);
+void handleMenu();
+void settingDurasi(int sysIndex, int &durasi, const String &label, int addr);
+void tampilMenu();
+
+
+// --- Interupsi Coin Acceptor 1 ---
+void IRAM_ATTR detectCoin1() {
+  unsigned long now = millis();
+  if (now - systems[0].lastCoinPulseTime > 50) {
+    systems[0].coinPulseCount++;
+    systems[0].lastCoinPulseTime = now;
+  }
+}
+
+// --- Interupsi Coin Acceptor 2 ---
+void IRAM_ATTR detectCoin2() {
+  unsigned long now = millis();
+  if (now - systems[1].lastCoinPulseTime > 50) {
+    systems[1].coinPulseCount++;
+    systems[1].lastCoinPulseTime = now;
+  }
+}
+
+// --- Fungsi Tampil LCD Universal ---
+void tampilLCD(int sysIndex, const String &line1, const String &line2) {
+  if (line1 != systems[sysIndex].lastLine1 || line2 != systems[sysIndex].lastLine2) {
+    
+    // SISTEM 1 (I2C)
+    if (sysIndex == 0) {
+      LiquidCrystal_I2C *lcd_i2c = (LiquidCrystal_I2C *)systems[0].lcd;
+      lcd_i2c->clear();
+      lcd_i2c->setCursor(0, 0);
+      lcd_i2c->print(line1);
+      lcd_i2c->setCursor(0, 1);
+      lcd_i2c->print(line2);
+    } 
+    // SISTEM 2 (PARALEL)
+    else if (sysIndex == 1) {
+      LiquidCrystal *lcd_parallel = (LiquidCrystal *)systems[1].lcd;
+      lcd_parallel->clear();
+      lcd_parallel->setCursor(0, 0);
+      lcd_parallel->print(line1);
+      lcd_parallel->setCursor(0, 1);
+      lcd_parallel->print(line2);
+    }
+    
+    systems[sysIndex].lastLine1 = line1;
+    systems[sysIndex].lastLine2 = line2;
+  }
+}
+
+// --- Fungsi Tambah Waktu Universal ---
+void tambahWaktu(int sysIndex, int pulsa) {
+  // ... (Logika Tambah Waktu sama seperti sebelumnya)
+  int tambahDetik = 0;
+  int durasi500 = systems[sysIndex].durasi500;
+  int durasi1000 = systems[sysIndex].durasi1000;
+  
+  if (pulsa == 1) {
+    tambahDetik = durasi500;
+  } else if (pulsa >= 2 && pulsa <= 5) {
+    tambahDetik = durasi1000;
+  } else {
+    return;
+  }
+
+  systems[sysIndex].totalWaktu_detik += tambahDetik;
+  if (systems[sysIndex].totalWaktu_detik > MAX_WAKTU) systems[sysIndex].totalWaktu_detik = MAX_WAKTU;
+
+  systems[sysIndex].waktuMulai = millis();
+  systems[sysIndex].isRunning = true;
+  digitalWrite(systems[sysIndex].relayPin, LOW);  // relay ON
+
+  tampilLCD(sysIndex, "Koin Diterima!", "+" + String(tambahDetik / 60) + " Menit");
+  delay(800);
+  systems[sysIndex].lastLine1 = "";  // paksa LCD update
+  systems[sysIndex].lastLine2 = "";
+}
+
+// --- Fungsi Tampil Menu Pengaturan ---
+void tampilMenu() {
+  String line1, line2;
+  
+  int numMenus = 5;
+  selectedMenu = (selectedMenu + numMenus) % numMenus;
+
+  switch (selectedMenu) {
+    case 0:
+      line1 = "->SET 500 (Sistem 1)";
+      line2 = "  SET 1000 (Sistem 1)";
+      break;
+    case 1:
+      line1 = "  SET 500 (Sistem 1)";
+      line2 = "->SET 1000 (Sistem 1)";
+      break;
+    case 2:
+      line1 = "->SET 500 (Sistem 2)";
+      line2 = "  SET 1000 (Sistem 2)";
+      break;
+    case 3:
+      line1 = "  SET 500 (Sistem 2)";
+      line2 = "->SET 1000 (Sistem 2)";
+      break;
+    case 4:
+      line1 = "  SET 1000 (Sistem 2)";
+      line2 = "->EXIT";
+      break;
+  }
+  
+  // Tampilkan menu di LCD Sistem 1 (I2C)
+  LiquidCrystal_I2C *lcd_i2c = (LiquidCrystal_I2C *)systems[0].lcd;
+  lcd_i2c->clear();
+  lcd_i2c->setCursor(0, 0);
+  lcd_i2c->print(line1);
+  lcd_i2c->setCursor(0, 1);
+  lcd_i2c->print(line2);
+  
+  // Tampilkan informasi di LCD Sistem 2 (Paralel)
+  LiquidCrystal *lcd_parallel = (LiquidCrystal *)systems[1].lcd;
+  lcd_parallel->clear();
+  lcd_parallel->setCursor(0, 0);
+  lcd_parallel->print("--- MENU UTAMA ---");
+  lcd_parallel->setCursor(0, 1);
+  lcd_parallel->print("Lihat LCD KIRI");
+}
+
+// --- Fungsi Handle Menu ---
+void handleMenu() {
+  // ... (Logika handleMenu sama seperti sebelumnya)
+  if (digitalRead(BUTTON_UP) == LOW) {
+    delay(150);
+    selectedMenu = (selectedMenu - 1 + 5) % 5;
+    tampilMenu();
+    while (digitalRead(BUTTON_UP) == LOW) ;
+  }
+
+  if (digitalRead(BUTTON_DOWN) == LOW) {
+    delay(150);
+    selectedMenu = (selectedMenu + 1) % 5;
+    tampilMenu();
+    while (digitalRead(BUTTON_DOWN) == LOW) ;
+  }
+
+  if (digitalRead(BUTTON_OK) == LOW) {
+    delay(150);
+    while (digitalRead(BUTTON_OK) == LOW) ;
+    switch (selectedMenu) {
+      case 0: mode = SET_500_1; break;
+      case 1: mode = SET_1000_1; break;
+      case 2: mode = SET_500_2; break;
+      case 3: mode = SET_1000_2; break;
+      case 4: mode = STANDBY; break;
+    }
+    ((LiquidCrystal_I2C *)systems[0].lcd)->clear();
+    ((LiquidCrystal *)systems[1].lcd)->clear();
+  }
+}
+
+// --- Fungsi Setting Durasi Universal ---
+void settingDurasi(int sysIndex, int &durasi, const String &label, int addr) {
+  int displayIndex = sysIndex + 1;
+  
+  char buf[17];
+  sprintf(buf, "<- %2d m -> (OK)", durasi / 60);
+  tampilLCD(sysIndex, "Set S" + String(displayIndex) + " " + label, buf);
+
+  if (digitalRead(BUTTON_UP) == LOW) {
+    delay(150);
+    if (durasi < 3600) durasi += 60;
+    while (digitalRead(BUTTON_UP) == LOW) ;
+  }
+
+  if (digitalRead(BUTTON_DOWN) == LOW) {
+    delay(150);
+    if (durasi > 60) durasi -= 60;
+    while (digitalRead(BUTTON_DOWN) == LOW) ;
+  }
+
+  if (digitalRead(BUTTON_OK) == LOW) {
+    delay(150);
+    EEPROM.put(addr, durasi);
+    EEPROM.commit();
+    tampilLCD(sysIndex, "Tersimpan!", label + "=" + String(durasi / 60) + "m");
+    delay(1000);
+    mode = MENU;
+    while (digitalRead(BUTTON_OK) == LOW) ;
+  }
+  
+  // Tampilkan pesan di LCD yang tidak di setting
+  int otherIndex = (sysIndex == 0) ? 1 : 0;
+  if (otherIndex == 0) { // Sistem 1 (I2C)
+    LiquidCrystal_I2C *other_lcd = (LiquidCrystal_I2C *)systems[otherIndex].lcd;
+    other_lcd->clear();
+    other_lcd->setCursor(0, 0);
+    other_lcd->print("Sistem " + String(displayIndex) + " di Set");
+    other_lcd->setCursor(0, 1);
+    other_lcd->print("Tunggu...");
+  } else { // Sistem 2 (Paralel)
+    LiquidCrystal *other_lcd = (LiquidCrystal *)systems[otherIndex].lcd;
+    other_lcd->clear();
+    other_lcd->setCursor(0, 0);
+    other_lcd->print("Sistem " + String(displayIndex) + " di Set");
+    other_lcd->setCursor(0, 1);
+    other_lcd->print("Tunggu...");
+  }
+}
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(115200);
+
+  // Inisialisasi Data Sistem 1 (I2C)
+  systems[0].coinPin = COIN_PIN_1;
+  systems[0].relayPin = RELAY_PIN_1;
+  systems[0].lcd = new LiquidCrystal_I2C(LCD_ADDR_1, 16, 2);
+  // ... inisialisasi lainnya
+
+  // Inisialisasi Data Sistem 2 (Paralel)
+  systems[1].coinPin = COIN_PIN_2;
+  systems[1].relayPin = RELAY_PIN_2;
+  systems[1].lcd = new LiquidCrystal(LCD_RS_2, LCD_EN_2, LCD_D4_2, LCD_D5_2, LCD_D6_2, LCD_D7_2);
+  // ... inisialisasi lainnya
+
+  // Setup Pin Relay
+  pinMode(RELAY_PIN_1, OUTPUT);
+  digitalWrite(RELAY_PIN_1, HIGH);
+  pinMode(RELAY_PIN_2, OUTPUT);
+  digitalWrite(RELAY_PIN_2, HIGH);
+  delay(100);
+
+  // Setup Pin Coin Acceptor dan Interupsi
+  pinMode(COIN_PIN_1, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(COIN_PIN_1), detectCoin1, FALLING);
+  pinMode(COIN_PIN_2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(COIN_PIN_2), detectCoin2, FALLING);
+
+  // Setup Pin Tombol
+  pinMode(BUTTON_OK, INPUT_PULLUP);
+  pinMode(BUTTON_UP, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  
+  // Setup Pin LCD Paralel
+  pinMode(LCD_D4_2, OUTPUT);
+  pinMode(LCD_D5_2, OUTPUT);
+  pinMode(LCD_D6_2, OUTPUT);
+  pinMode(LCD_D7_2, OUTPUT);
+  pinMode(LCD_RS_2, OUTPUT);
+  pinMode(LCD_EN_2, OUTPUT);
+
+  // Inisialisasi LCD
+  ((LiquidCrystal_I2C *)systems[0].lcd)->init();
+  ((LiquidCrystal_I2C *)systems[0].lcd)->backlight();
+  ((LiquidCrystal *)systems[1].lcd)->begin(16, 2); // Begin untuk LCD Paralel
+  
+  tampilLCD(0, "S1 I2C PS ADS", "Memuat...");
+  tampilLCD(1, "S2 Paralel PS", "Memuat...");
+
+  // Muat Durasi dari EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(ADDR_DURASI_500_1, systems[0].durasi500);
+  EEPROM.get(ADDR_DURASI_1000_1, systems[0].durasi1000);
+  EEPROM.get(ADDR_DURASI_500_2, systems[1].durasi500);
+  EEPROM.get(ADDR_DURASI_1000_2, systems[1].durasi1000);
+
+  // Validasi dan Simpan Default jika nilai tidak valid
+  for (int i = 0; i < 2; i++) {
+    if (systems[i].durasi500 < 60 || systems[i].durasi500 > 3600) systems[i].durasi500 = 6 * 60;
+    if (systems[i].durasi1000 < 60 || systems[i].durasi1000 > 3600) systems[i].durasi1000 = 14 * 60;
+  }
+  EEPROM.put(ADDR_DURASI_500_1, systems[0].durasi500);
+  EEPROM.put(ADDR_DURASI_1000_1, systems[0].durasi1000);
+  EEPROM.put(ADDR_DURASI_500_2, systems[1].durasi500);
+  EEPROM.put(ADDR_DURASI_1000_2, systems[1].durasi1000);
+  EEPROM.commit();
+
+  tampilLCD(0, "Sistem 1 Siap!", "I2C");
+  tampilLCD(1, "Sistem 2 Siap!", "Paralel");
+  delay(1000);
+}
+
+// --- LOOP ---
+void loop() {
+  // ... (Logika loop sama seperti sebelumnya, hanya menggunakan fungsi tampilLCD yang sudah diperbarui)
+  
+  // --- Cek Tombol OK Lama (Menu) ---
+  if ((mode == STANDBY || mode == RUNNING) && digitalRead(BUTTON_OK) == LOW) {
+    unsigned long startPress = millis();
+    while (digitalRead(BUTTON_OK) == LOW) ;
+    if (millis() - startPress >= 2000) {
+      if (systems[0].isRunning || systems[1].isRunning) {
+        tampilLCD(0, "PERINGATAN S1!", "Masih BERJALAN!");
+        tampilLCD(1, "PERINGATAN S2!", "Masih BERJALAN!");
+        delay(1500);
+      }
+      mode = MENU;
+      selectedMenu = 0;
+      tampilMenu();
+      return;
+    }
+  }
+
+  // --- Cek Koin Sistem 1 ---
+  if (systems[0].coinPulseCount > 0 && millis() - systems[0].lastCoinPulseTime > 300) {
+    if (mode != MENU && mode != SET_500_1 && mode != SET_1000_1 && mode != SET_500_2 && mode != SET_1000_2) {
+      noInterrupts();
+      int pulsa = systems[0].coinPulseCount;
+      systems[0].coinPulseCount = 0;
+      interrupts();
+      tambahWaktu(0, pulsa); // 0 = Sistem 1
+    }
+  }
+
+  // --- Cek Koin Sistem 2 ---
+  if (systems[1].coinPulseCount > 0 && millis() - systems[1].lastCoinPulseTime > 300) {
+    if (mode != MENU && mode != SET_500_1 && mode != SET_1000_1 && mode != SET_500_2 && mode != SET_1000_2) {
+      noInterrupts();
+      int pulsa = systems[1].coinPulseCount;
+      systems[1].coinPulseCount = 0;
+      interrupts();
+      tambahWaktu(1, pulsa); // 1 = Sistem 2
+    }
+  }
+
+  // --- Logika Mode ---
+  switch (mode) {
+    case STANDBY:
+      // Tampilkan Standby untuk Sistem 1
+      tampilLCD(0, "Masukan Koin S1", "500=" + String(systems[0].durasi500 / 60) + "m 1K=" + String(systems[0].durasi1000 / 60) + "m");
+      // Tampilkan Standby untuk Sistem 2
+      tampilLCD(1, "Masukan Koin S2", "500=" + String(systems[1].durasi500 / 60) + "m 1K=" + String(systems[1].durasi1000 / 60) + "m");
+      break;
+
+    case RUNNING:
+      // Logika Waktu Sistem 1
+      if (systems[0].isRunning) {
+        unsigned long berjalan = (millis() - systems[0].waktuMulai) / 1000;
+        long sisa = systems[0].totalWaktu_detik - berjalan;
+        if (sisa <= 0) {
+          sisa = 0;
+          systems[0].isRunning = false;
+          systems[0].totalWaktu_detik = 0;
+          digitalWrite(RELAY_PIN_1, HIGH); // Relay 1 OFF
+          tampilLCD(0, "Waktu Habis S1", "Masukan Koin");
+          delay(1500);
+        } else {
+          int m = sisa / 60;
+          int d = sisa % 60;
+          char buf[17];
+          sprintf(buf, "%02d:%02d", m, d);
+          tampilLCD(0, "S1 Sisa Waktu:", buf);
+        }
+      } else {
+        tampilLCD(0, "Masukan Koin S1", "500=" + String(systems[0].durasi500 / 60) + "m 1K=" + String(systems[0].durasi1000 / 60) + "m");
+      }
+
+      // Logika Waktu Sistem 2
+      if (systems[1].isRunning) {
+        unsigned long berjalan = (millis() - systems[1].waktuMulai) / 1000;
+        long sisa = systems[1].totalWaktu_detik - berjalan;
+        if (sisa <= 0) {
+          sisa = 0;
+          systems[1].isRunning = false;
+          systems[1].totalWaktu_detik = 0;
+          digitalWrite(RELAY_PIN_2, HIGH); // Relay 2 OFF
+          tampilLCD(1, "Waktu Habis S2", "Masukan Koin");
+          delay(1500);
+        } else {
+          int m = sisa / 60;
+          int d = sisa % 60;
+          char buf[17];
+          sprintf(buf, "%02d:%02d", m, d);
+          tampilLCD(1, "S2 Sisa Waktu:", buf);
+        }
+      } else {
+        tampilLCD(1, "Masukan Koin S2", "500=" + String(systems[1].durasi500 / 60) + "m 1K=" + String(systems[1].durasi1000 / 60) + "m");
+      }
+      
+      // Jika kedua sistem sudah selesai, kembali ke STANDBY
+      if (!systems[0].isRunning && !systems[1].isRunning) {
+          mode = STANDBY;
+      }
+      break;
+      
+    case MENU:
+      handleMenu();
+      break;
+
+    case SET_500_1:
+      settingDurasi(0, systems[0].durasi500, "500", ADDR_DURASI_500_1);
+      break;
+
+    case SET_1000_1:
+      settingDurasi(0, systems[0].durasi1000, "1000", ADDR_DURASI_1000_1);
+      break;
+      
+    case SET_500_2:
+      settingDurasi(1, systems[1].durasi500, "500", ADDR_DURASI_500_2);
+      break;
+
+    case SET_1000_2:
+      settingDurasi(1, systems[1].durasi1000, "1000", ADDR_DURASI_1000_2);
+      break;
+  }
+
+  delay(50);
+}
