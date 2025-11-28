@@ -12,7 +12,7 @@
 #define ADDR_DURASI_500     0
 #define ADDR_DURASI_1000    4
 
-LiquidCrystal_I2C lcd(0x37, 16, 2);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 volatile int coinPulseCount = 0;
 volatile unsigned long lastCoinPulseTime = 0;
